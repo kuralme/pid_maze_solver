@@ -14,7 +14,8 @@ class MazeSolver : public rclcpp::Node {
 public:
   MazeSolver(int scene_number)
       : Node("pid_maze_solver"), scene_number_(scene_number), got_odom_(false),
-        wp_reached_(false), init_(true), paused_(false), target_wp_(0) {
+        turn_phase_(false), wp_reached_(false), init_(true), paused_(false),
+        target_wp_(0) {
     twist_pub_ =
         this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -33,29 +34,25 @@ private:
     switch (scene_number_) {
     case 1: // Simulation
       waypoints_ = {{
-          {0.335, 0.0, 0.0},    // w1
-          {0.205, -0.174, 0.0}, // w2
-          {0.0, -1.25, 0.0},    // w3
-          {0.52, 0.0, 0.0},     // w4
-          {0.0, 0.519, 0.0},    // w5
-          {0.382, 0.0, 0.0},    // w6
-          {0.0, 0.567, 0.0},    // w7
-          {0.55, 0.0, 0.0},     // w8
-          {0.0, 0.895, 0.0},    // w9
-          {-0.47, 0.0, 0.0},    // w10
-          {0.0, -0.35, 0.0},    // w11
-          {-0.445, 0.0, 0.0},   // w12
-          {-0.35, 0.35, 0.0},   // w13
-          {-0.68, 0.0, 0.0},    // w14
+          {0.335, 0.0, -M_PI_4},   // w1
+          {0.185, -0.18, -M_PI_4}, // w2
+          {0.0, -1.15, M_PI_2},    // w3
+          {0.52, 0.0, M_PI_2},     // w4
+          {0.0, 0.5, 0.0},         // w5
+          {0.38, 0.0, 0.0},        // w6
+          {0.0, 0.567, 0.0},       // w7
+          {0.55, 0.0, 0.0},        // w8
+          {0.0, 0.82, M_PI_2},     // w9
+          {-0.465, 0.0, 0.0},      // w10
+          {0.0, -0.33, 0.0},       // w11
+          {-0.455, 0.0, -M_PI_4},  // w12
+          {-0.3, 0.32, M_PI_4},    // w13
+          {-0.6, 0.0, M_PI},       // w14
       }};
       break;
 
     case 2: // CyberWorld
-      waypoints_ = {{
-          {0.0, 0.0, -0.483}, // w1
-          {0.0, 0.0, -0.812}, // w2
-          {0.0, 0.0, 1.291},  // w3
-      }};
+      waypoints_ = {{}};
       break;
 
     default:
@@ -105,50 +102,84 @@ private:
 
     // Error vector
     Eigen::Vector3f error_pose = target_pose_ - current_pose_;
+    if (error_pose(2) > M_PI) {
+      error_pose(2) -= 2 * M_PI;
+    } else if (error_pose(2) < -M_PI) {
+      error_pose(2) += 2 * M_PI;
+    }
 
     // Check distance to target
-    if (error_pose.norm() < 0.02) {
+    if (std::hypot(error_pose(0), error_pose(1)) < 0.02) {
       auto msg = geometry_msgs::msg::Twist();
       twist_pub_->publish(msg);
 
-      prev_error_ = {0.0, 0.0, 0.0};
-      integral_error_ = {0.0, 0.0, 0.0};
-      wp_reached_ = true;
-      target_wp_++;
+      if (std::abs(error_pose(2)) > 0.02) {
+        // PID Controller - Angular
+        integral_error_(2) += error_pose(2);
+        integral_error_(2) =
+            std::clamp(integral_error_(2), -int_limit_, int_limit_);
 
-      if (target_wp_ >= waypoints_.size()) {
-        RCLCPP_INFO(this->get_logger(), "Maze finished!");
-        rclcpp::shutdown();
+        float omega = (Kp_ * .7) * error_pose(2) +
+                      Kd_ * (error_pose(2) - prev_error_(2)) +
+                      Ki_ * integral_error_(2);
+        prev_error_(2) = error_pose(2);
+
+        // Publish velocities
+        auto cmd_vel = geometry_msgs::msg::Twist();
+        cmd_vel.angular.z = std::clamp(omega, -max_ang_vel_, max_ang_vel_);
+        twist_pub_->publish(cmd_vel);
       } else {
-        // Start the pause timer
-        pause_time_ = clock_->now();
-        paused_ = true;
-        RCLCPP_INFO(this->get_logger(),
-                    "Waypoint reached, stopping briefly...");
+        prev_error_ = {0.0, 0.0, 0.0};
+        integral_error_ = {0.0, 0.0, 0.0};
+        wp_reached_ = true;
+        target_wp_++;
+
+        if (target_wp_ >= waypoints_.size()) {
+          RCLCPP_INFO(this->get_logger(), "Maze finished!");
+          rclcpp::shutdown();
+        } else {
+          // Start the pause timer
+          pause_time_ = clock_->now();
+          paused_ = true;
+          RCLCPP_INFO(this->get_logger(),
+                      "Waypoint reached, stopping briefly...");
+        }
       }
       return;
     }
 
-    // PID Controller (Proportional + Integral + Derivative)
-
-    integral_error_ += error_pose; // Sum of errors over time
+    // PID Controller - Linear
+    integral_error_ += error_pose;
     integral_error_(0) =
         std::clamp(integral_error_(0), -int_limit_, int_limit_);
     integral_error_(1) =
         std::clamp(integral_error_(1), -int_limit_, int_limit_);
-    integral_error_(2) =
-        std::clamp(integral_error_(2), -int_limit_, int_limit_);
 
     Eigen::Vector3f V = Kp_ * error_pose + Kd_ * (error_pose - prev_error_) +
                         Ki_ * integral_error_;
-    prev_error_ = error_pose; // for next iteration
+    prev_error_ = error_pose;
 
-    // Publish velocities
+    V = recomputeTwist(V);
+
+    // Publish linear velocities
     auto cmd_vel = geometry_msgs::msg::Twist();
     cmd_vel.linear.x = std::clamp(V(0), -max_lin_vel_, max_lin_vel_);
     cmd_vel.linear.y = std::clamp(V(1), -max_lin_vel_, max_lin_vel_);
-    cmd_vel.angular.z = std::clamp(V(2), -max_ang_vel_, max_ang_vel_);
+    cmd_vel.angular.z = 0.0;
     twist_pub_->publish(cmd_vel);
+  }
+
+  Eigen::Vector3f recomputeTwist(const Eigen::Vector3f &V) {
+
+    float dphi = current_pose_(2);
+
+    // Transpose command into base frame
+    Eigen::Matrix3f R{{std::cos(dphi), std::sin(dphi), 0.0},
+                      {-std::sin(dphi), std::cos(dphi), 0.0},
+                      {0.0, 0.0, 1.0}};
+    // Velocity command vector transposed into robot frame
+    Eigen::Vector3f nu = R * V;
+    return nu;
   }
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
@@ -156,7 +187,7 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Time pause_time_;
   int scene_number_;
-  bool got_odom_, wp_reached_, init_, paused_;
+  bool got_odom_, turn_phase_, wp_reached_, init_, paused_;
   size_t target_wp_;
   std::shared_ptr<rclcpp::Clock> clock_;
   Eigen::Vector3f current_pose_{0.0, 0.0, 0.0};
