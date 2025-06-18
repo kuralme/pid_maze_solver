@@ -13,6 +13,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 include_directories(
   ${EIGEN3_INCLUDE_DIR}
@@ -31,11 +32,19 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(pid_maze_solver src/pid_maze_solver.cpp)
-ament_target_dependencies(pid_maze_solver rclcpp std_msgs nav_msgs tf2)
+ament_target_dependencies(pid_maze_solver rclcpp std_msgs geometry_msgs sensor_msgs nav_msgs tf2 yaml-cpp)
+
+target_link_libraries(pid_maze_solver yaml-cpp)
 
 install(TARGETS
    pid_maze_solver
    DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  FILES waypoints/waypoints_sim.yaml
+  FILES waypoints/waypoints_real.yaml
+  DESTINATION share/${PROJECT_NAME}/waypoints
 )
 
 ament_package()
