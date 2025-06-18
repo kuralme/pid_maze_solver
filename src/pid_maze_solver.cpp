@@ -1,6 +1,7 @@
 #include <Eigen/Dense>
 #include <array>
 #include <cmath>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -9,6 +10,8 @@
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/impl/utils.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 #include <yaml-cpp/yaml.h>
 
 using namespace std::chrono_literals;
@@ -29,6 +32,9 @@ public:
         std::bind(&MazeSolver::scanCallback, this, std::placeholders::_1));
     timer_ = this->create_wall_timer(
         200ms, std::bind(&MazeSolver::executeCallback, this));
+
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     SelectWaypoints();
     clock_ = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
@@ -51,10 +57,19 @@ private:
       }
       break;
     }
-
-    case 2: // CyberWorld
-      waypoints_ = {{}};
+    case 2: { // CyberWorld
+      std::string yaml_path = "/home/user/ros2_ws/src/pid_maze_solver/"
+                              "waypoints/waypoints_real.yaml";
+      YAML::Node config = YAML::LoadFile(yaml_path);
+      auto waypoints =
+          config["pid_maze_solver"]["ros__parameters"]["waypoints_real"];
+      for (size_t i = 0; i < 14; ++i) {
+        waypoints_[i] = Eigen::Vector3f(waypoints[i * 3].as<float>(),
+                                        waypoints[i * 3 + 1].as<float>(),
+                                        waypoints[i * 3 + 2].as<float>());
+      }
       break;
+    }
 
     default:
       RCLCPP_ERROR(this->get_logger(), "Invalid Scene Number: %d",
@@ -62,27 +77,43 @@ private:
     }
   }
 
-  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-    auto orientation = msg->pose.pose.orientation;
-    tf2::Quaternion q(orientation.x, orientation.y, orientation.z,
-                      orientation.w);
-    current_pose_(0) = msg->pose.pose.position.x;
-    current_pose_(1) = msg->pose.pose.position.y;
-    current_pose_(2) = tf2::impl::getYaw(q);
-    got_odom_ = true;
+  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr /*msg*/) {
+    // Use tf2 to get transform from odom to base_link
+    geometry_msgs::msg::TransformStamped transformStamped;
+    try {
+      transformStamped =
+          tf_buffer_->lookupTransform("odom", "base_link", tf2::TimePointZero);
+
+      // Translation
+      current_pose_(0) = transformStamped.transform.translation.x;
+      current_pose_(1) = transformStamped.transform.translation.y;
+
+      // Yaw from quaternion
+      tf2::Quaternion q(transformStamped.transform.rotation.x,
+                        transformStamped.transform.rotation.y,
+                        transformStamped.transform.rotation.z,
+                        transformStamped.transform.rotation.w);
+      current_pose_(2) = tf2::impl::getYaw(q);
+
+      got_odom_ = true;
+    } catch (tf2::TransformException &ex) {
+      RCLCPP_WARN(this->get_logger(), "Could not transform odom->base_link: %s",
+                  ex.what());
+      got_odom_ = false;
+    }
   }
 
   void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
-    if (msg->ranges.empty() || msg->intensities.empty()) {
-      RCLCPP_WARN(this->get_logger(), "Scan data missing!!");
-      return;
-    }
     laser_ranges_ = msg->ranges;
   }
 
   void executeCallback() {
     if (!got_odom_) {
       RCLCPP_WARN(this->get_logger(), "Odom data not received!");
+      return;
+    }
+    if (laser_ranges_.empty()) {
+      RCLCPP_WARN(this->get_logger(), "Scan data missing!!");
       return;
     }
 
@@ -133,7 +164,7 @@ private:
         integral_error_(2) =
             std::clamp(integral_error_(2), -int_limit_, int_limit_);
 
-        float omega = (Kp_ * .7) * error_pose(2) +
+        float omega = Kp_ * error_pose(2) +
                       Kd_ * (error_pose(2) - prev_error_(2)) +
                       Ki_ * integral_error_(2);
         prev_error_(2) = error_pose(2);
@@ -172,12 +203,12 @@ private:
     Eigen::Vector3f V = Kp_ * error_pose + Kd_ * (error_pose - prev_error_) +
                         Ki_ * integral_error_;
     prev_error_ = error_pose;
-    V = recomputeTwist(V);
 
     // Apply course correction
     V = performCourseCorrection(V);
 
-    // Publish linear velocities
+    // Transform and publish linear velocities
+    V = recomputeTwist(V);
     auto cmd_vel = geometry_msgs::msg::Twist();
     cmd_vel.linear.x = std::clamp(V(0), -max_lin_vel_, max_lin_vel_);
     cmd_vel.linear.y = std::clamp(V(1), -max_lin_vel_, max_lin_vel_);
@@ -195,40 +226,38 @@ private:
     Eigen::Vector3f nu = R * V;
     return nu;
   }
+
   bool performWallAvoidance() {
 
     float front = laser_ranges_[0];
     float back = laser_ranges_[459];
-    float left = laser_ranges_[229];
-    float right = laser_ranges_[689];
+    // float left = laser_ranges_[229];
+    // float right = laser_ranges_[689];
 
     auto cmd_vel = geometry_msgs::msg::Twist();
-    bool avoided = false;
 
-    // Thresholds
-    const float min_dist = 0.2;
-    const float backoff_vel = 0.1;
-
-    if (front < min_dist) {
-      cmd_vel.linear.x = -backoff_vel;
-      avoided = true;
-    } else if (back < min_dist) {
-      cmd_vel.linear.x = backoff_vel;
-      avoided = true;
-    }
-
-    if (left < min_dist) {
-      cmd_vel.linear.y = -backoff_vel;
-      avoided = true;
-    } else if (right < min_dist) {
-      cmd_vel.linear.y = backoff_vel;
-      avoided = true;
-    }
-
-    if (avoided) {
-      RCLCPP_WARN(this->get_logger(), "Wall too close. Avoiding...");
+    Eigen::Vector2f target_correction = Eigen::Vector2f::Zero();
+    if (front < 0.18) {
+      RCLCPP_WARN(this->get_logger(), "Front wall too close. Avoiding...");
+      cmd_vel.linear.x = -0.05;
+      target_correction(0) -= 0.005; // update target
       twist_pub_->publish(cmd_vel);
-      return true; // Still avoiding
+
+    } else if (back < 0.24) {
+      RCLCPP_WARN(this->get_logger(), "Back wall too close. Avoiding...");
+      cmd_vel.linear.x = 0.05;
+      target_correction(0) += 0.005; // update target
+      twist_pub_->publish(cmd_vel);
+    }
+
+    // Transform correction
+    if (target_correction.norm() > 0.0) {
+      float dphi = current_pose_(2);
+      Eigen::Matrix2f R{{std::cos(dphi), -std::sin(dphi)},
+                        {std::sin(dphi), std::cos(dphi)}};
+      Eigen::Vector2f tranformed_target = R * target_correction;
+      target_pose_.head<2>() += tranformed_target;
+      return true;
     }
 
     return false;
@@ -239,7 +268,7 @@ private:
     float left = laser_ranges_[229];
     float right = laser_ranges_[689];
 
-    const float critical_dist = 0.15;
+    const float critical_dist = 0.21;
     const float min_valid = 0.05;
     const float max_valid = 5.0;
 
@@ -250,15 +279,26 @@ private:
 
     // Apply only if moving linearly
     if (std::abs(cmd_vel(0)) > 0.01 || std::abs(cmd_vel(1)) > 0.01) {
+      Eigen::Vector2f target_correction = Eigen::Vector2f::Zero();
+
       if (left_valid && left < critical_dist) {
-        vel_updt(1) += 0.05;
-      } else if (right_valid && right < critical_dist) {
-        vel_updt(1) -= 0.05;
-      } else if (left_valid && right_valid) {
-        float drift_error = right - left;
-        if (std::abs(drift_error) > 0.15) {
-          vel_updt(1) += -0.01 * (drift_error > 0 ? 1 : -1);
-        }
+        RCLCPP_WARN(this->get_logger(), "Course correcting to right...");
+        vel_updt(1) -= 0.03;
+        target_correction(1) -= 0.005; // update target
+
+      } else if (right_valid && right < (critical_dist - .2)) {
+        RCLCPP_WARN(this->get_logger(), "Course correcting to left...");
+        vel_updt(1) += 0.03;
+        target_correction(1) += 0.005; // update target
+      }
+
+      // Transform correction
+      if (target_correction.norm() > 0.0) {
+        float dphi = current_pose_(2);
+        Eigen::Matrix2f R{{std::cos(dphi), -std::sin(dphi)},
+                          {std::sin(dphi), std::cos(dphi)}};
+        Eigen::Vector2f tranformed_target = R * target_correction;
+        target_pose_.head<2>() += tranformed_target;
       }
     }
     return vel_updt;
@@ -267,6 +307,8 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Time pause_time_;
   int scene_number_;
@@ -281,18 +323,18 @@ private:
   std::vector<float> laser_ranges_;
 
   // PID Gains
-  const float Kp_ = 1.2;
-  const float Ki_ = 0.02, int_limit_ = 5.0;
-  const float Kd_ = 0.8;
-  const float max_lin_vel_ = 0.7;
-  const float max_ang_vel_ = 1.0;
+  const float Kp_ = 0.6;
+  const float Ki_ = 0.005, int_limit_ = 5.0;
+  const float Kd_ = 0.35;
+  const float max_lin_vel_ = 0.25;
+  const float max_ang_vel_ = 0.8;
 };
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
 
   // Check if a scene number argument is provided
-  int scene_number = 1; // Default scene number to simulation
+  int scene_number = 2; // Default scene number to cyberworld
   if (argc > 1) {
     scene_number = std::atoi(argv[1]);
   }
