@@ -1,8 +1,10 @@
 #include <Eigen/Dense>
 #include <array>
 #include <cmath>
+#include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
@@ -21,6 +23,9 @@ public:
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
         "/odometry/filtered", 10,
         std::bind(&MazeSolver::odomCallback, this, std::placeholders::_1));
+    scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+        "/scan_filtered", 10,
+        std::bind(&MazeSolver::scanCallback, this, std::placeholders::_1));
     timer_ = this->create_wall_timer(
         200ms, std::bind(&MazeSolver::executeCallback, this));
 
@@ -45,7 +50,7 @@ private:
           {0.0, 0.82, M_PI_2},     // w9
           {-0.465, 0.0, 0.0},      // w10
           {0.0, -0.33, 0.0},       // w11
-          {-0.455, 0.0, -M_PI_4},  // w12
+          {-0.465, 0.0, -M_PI_4},  // w12
           {-0.3, 0.32, M_PI_4},    // w13
           {-0.6, 0.0, M_PI},       // w14
       }};
@@ -69,6 +74,14 @@ private:
     current_pose_(1) = msg->pose.pose.position.y;
     current_pose_(2) = tf2::impl::getYaw(q);
     got_odom_ = true;
+  }
+
+  void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+    if (msg->ranges.empty() || msg->intensities.empty()) {
+      RCLCPP_WARN(this->get_logger(), "Scan data missing!!");
+      return;
+    }
+    laser_ranges_ = msg->ranges;
   }
 
   void executeCallback() {
@@ -108,10 +121,15 @@ private:
       error_pose(2) += 2 * M_PI;
     }
 
-    // Check distance to target
+    // Check distance to target waypoint
     if (std::hypot(error_pose(0), error_pose(1)) < 0.02) {
       auto msg = geometry_msgs::msg::Twist();
       twist_pub_->publish(msg);
+
+      // Perform wall avoidance
+      if (performWallAvoidance()) {
+        return;
+      }
 
       if (std::abs(error_pose(2)) > 0.02) {
         // PID Controller - Angular
@@ -158,8 +176,10 @@ private:
     Eigen::Vector3f V = Kp_ * error_pose + Kd_ * (error_pose - prev_error_) +
                         Ki_ * integral_error_;
     prev_error_ = error_pose;
-
     V = recomputeTwist(V);
+
+    // Apply course correction
+    V = performCourseCorrection(V);
 
     // Publish linear velocities
     auto cmd_vel = geometry_msgs::msg::Twist();
@@ -172,8 +192,6 @@ private:
   Eigen::Vector3f recomputeTwist(const Eigen::Vector3f &V) {
 
     float dphi = current_pose_(2);
-
-    // Transpose command into base frame
     Eigen::Matrix3f R{{std::cos(dphi), std::sin(dphi), 0.0},
                       {-std::sin(dphi), std::cos(dphi), 0.0},
                       {0.0, 0.0, 1.0}};
@@ -181,9 +199,78 @@ private:
     Eigen::Vector3f nu = R * V;
     return nu;
   }
+  bool performWallAvoidance() {
+
+    float front = laser_ranges_[0];
+    float back = laser_ranges_[459];
+    float left = laser_ranges_[229];
+    float right = laser_ranges_[689];
+
+    auto cmd_vel = geometry_msgs::msg::Twist();
+    bool avoided = false;
+
+    // Thresholds
+    const float min_dist = 0.2;
+    const float backoff_vel = 0.1;
+
+    if (front < min_dist) {
+      cmd_vel.linear.x = -backoff_vel;
+      avoided = true;
+    } else if (back < min_dist) {
+      cmd_vel.linear.x = backoff_vel;
+      avoided = true;
+    }
+
+    if (left < min_dist) {
+      cmd_vel.linear.y = -backoff_vel;
+      avoided = true;
+    } else if (right < min_dist) {
+      cmd_vel.linear.y = backoff_vel;
+      avoided = true;
+    }
+
+    if (avoided) {
+      RCLCPP_WARN(this->get_logger(), "Wall too close. Avoiding...");
+      twist_pub_->publish(cmd_vel);
+      return true; // Still avoiding
+    }
+
+    return false;
+  }
+
+  Eigen::Vector3f performCourseCorrection(const Eigen::Vector3f &cmd_vel) {
+
+    float left = laser_ranges_[229];
+    float right = laser_ranges_[689];
+
+    const float critical_dist = 0.15;
+    const float min_valid = 0.05;
+    const float max_valid = 5.0;
+
+    Eigen::Vector3f vel_updt = cmd_vel;
+
+    bool left_valid = (left > min_valid && left < max_valid);
+    bool right_valid = (right > min_valid && right < max_valid);
+
+    // Apply only if moving linearly
+    if (std::abs(cmd_vel(0)) > 0.01 || std::abs(cmd_vel(1)) > 0.01) {
+      if (left_valid && left < critical_dist) {
+        vel_updt(1) += 0.05;
+      } else if (right_valid && right < critical_dist) {
+        vel_updt(1) -= 0.05;
+      } else if (left_valid && right_valid) {
+        float drift_error = right - left;
+        if (std::abs(drift_error) > 0.15) {
+          vel_updt(1) += -0.01 * (drift_error > 0 ? 1 : -1);
+        }
+      }
+    }
+    return vel_updt;
+  }
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Time pause_time_;
   int scene_number_;
@@ -195,6 +282,7 @@ private:
   Eigen::Vector3f prev_error_{0.0, 0.0, 0.0};
   Eigen::Vector3f integral_error_{0.0, 0.0, 0.0};
   std::array<Eigen::Vector3f, 14> waypoints_;
+  std::vector<float> laser_ranges_;
 
   // PID Gains
   const float Kp_ = 1.2;
