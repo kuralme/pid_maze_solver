@@ -1,0 +1,3 @@
+pid_maze_solver:
+  ros__parameters:
+    waypoints_real: [0.0, 0.0, 0.0,]
