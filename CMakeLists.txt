@@ -9,6 +9,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -32,7 +33,7 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(pid_maze_solver src/pid_maze_solver.cpp)
-ament_target_dependencies(pid_maze_solver rclcpp std_msgs geometry_msgs sensor_msgs nav_msgs tf2 yaml-cpp)
+ament_target_dependencies(pid_maze_solver rclcpp std_msgs geometry_msgs sensor_msgs nav_msgs tf2 tf2_ros yaml-cpp)
 
 target_link_libraries(pid_maze_solver yaml-cpp)
 
